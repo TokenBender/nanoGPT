@@ -22,7 +22,11 @@ import math
 import pickle
 from contextlib import nullcontext
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # minimal fallback when numpy is unavailable
+    np = None
+    import array
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -116,13 +120,22 @@ data_dir = os.path.join('data', dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    path = os.path.join(data_dir, 'train.bin' if split == 'train' else 'val.bin')
+    if np is not None:
+        data = np.memmap(path, dtype=np.uint16, mode='r')
+        get_slice = lambda i, l: torch.from_numpy((data[i:i+l]).astype(np.int64))
+        data_len = len(data)
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        import array
+        with open(path, 'rb') as f:
+            buf = array.array('H')
+            buf.fromfile(f, os.path.getsize(path) // 2)
+        data = buf
+        get_slice = lambda i, l: torch.tensor(data[i:i+l], dtype=torch.int64)
+        data_len = len(data)
+    ix = torch.randint(data_len - block_size, (batch_size,))
+    x = torch.stack([get_slice(i, block_size) for i in ix])
+    y = torch.stack([get_slice(i + 1, block_size) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
